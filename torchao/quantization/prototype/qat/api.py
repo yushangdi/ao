@@ -18,9 +18,17 @@ from torchao.quantization.GPTQ import (
     Int8DynActInt4WeightLinear,
     WeightOnlyInt4Linear,
 )
-from torchao.quantization.quant_primitives import ZeroPointDomain
+from torchao.quantization.quant_api import (
+    _get_linear_subclass_inserter,
+    quantize_,
+)
+from torchao.quantization.quant_primitives import (
+    MappingType,
+    ZeroPointDomain,
+)
 from torchao.quantization.unified import TwoStepQuantizer
 from torchao.quantization.utils import get_group_qparams_symmetric
+from .affine_fake_quantized_tensor import to_affine_fake_quantized
 from .utils import (
     _choose_qparams_per_token_asymmetric,
     _fake_quantize_per_channel_group,
@@ -210,6 +218,39 @@ def disable_8da4w_fake_quant(mod: torch.nn.Module):
 # ==================
 # |   int4wo QAT   |
 # ==================
+
+def int4_weight_only_fake_quantize(group_size=128):
+    """
+    Applies uint4 weight-only asymmetric per-group fake quantization to linear layers.
+    Please see :func:`~torchao.quantization.int4_weight_only` for more details.
+
+    Example usage:
+        from torchao.quantization import quantize_
+        quantize_(model, int4_weight_only_fake_quantize(group_size=32))
+    """
+    def _apply_fake_quant(weight):
+        mapping_type = MappingType.ASYMMETRIC
+        block_size = (1, group_size)
+        target_dtype = torch.int32
+        quant_min = 0
+        quant_max = 15
+        eps = 1e-6
+        preserve_zero = False
+        zero_point_dtype = torch.bfloat16
+        zero_point_domain = ZeroPointDomain.FLOAT
+        return to_affine_fake_quantized(
+            weight,
+            mapping_type,
+            block_size,
+            target_dtype,
+            quant_min,
+            quant_max,
+            eps,
+            zero_point_dtype=zero_point_dtype,
+            preserve_zero=preserve_zero,
+            zero_point_domain=zero_point_domain,
+        )
+    return _get_linear_subclass_inserter(_apply_fake_quant, requires_grad=True)
 
 class Int4WeightOnlyQATQuantizer(TwoStepQuantizer):
     """

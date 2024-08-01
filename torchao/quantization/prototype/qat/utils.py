@@ -29,19 +29,19 @@ class _GenericFakeQuantize(torch.autograd.Function):
     def forward(
         ctx: torch.autograd.function.FunctionCtx,
         input: torch.Tensor,
+        block_size: List[int],
         scales: torch.Tensor,
         zero_points: torch.Tensor,
         quant_min: int,
         quant_max: int,
-        block_size: List[int],
         zero_point_domain: ZeroPointDomain = ZeroPointDomain.INT,
     ) -> torch.Tensor:
-        # Note: for bf16 inputs, casting them to fp32 has the unexpected
-        # side effect of reducing memory footprint significantly, presumably
-        # because bf16 * fp32 kernels are not as memory efficient
-        assert input.dtype == torch.float32
-        assert scales.dtype == torch.float32
-        assert zero_points.dtype == torch.int32
+        ## Note: for bf16 inputs, casting them to fp32 has the unexpected
+        ## side effect of reducing memory footprint significantly, presumably
+        ## because bf16 * fp32 kernels are not as memory efficient
+        #assert input.dtype == torch.float32
+        #assert scales.dtype == torch.float32
+        #assert zero_points.dtype == torch.int32
 
         (fq, mask) = fake_quantize_affine_cachemask(
             input,
@@ -76,7 +76,7 @@ def _fake_quantize_per_channel_group(
     assert input.dim() == 2
     block_size = (1, group_size)
     return _GenericFakeQuantize.apply(
-        input, scales, zero_points, quant_min, quant_max, block_size, zero_point_domain,
+        input, block_size, scales, zero_points, quant_min, quant_max, zero_point_domain,
     )
 
 def _fake_quantize_per_token(
@@ -92,7 +92,7 @@ def _fake_quantize_per_token(
     block_size = _get_per_token_block_size(input)
     fq_input = input.to(torch.float32)
     fq = _GenericFakeQuantize.apply(
-        fq_input, scales, zero_points, quant_min, quant_max, block_size,
+        fq_input, block_size, scales, zero_points, quant_min, quant_max,
     )
     return fq.reshape_as(input).to(input.dtype)
 

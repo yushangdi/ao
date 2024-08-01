@@ -353,7 +353,7 @@ class TestQAT(unittest.TestCase):
         block_size = (1, ao_input.shape[-1])
         ao_s = copy.deepcopy(py_s)
         ao_zp = copy.deepcopy(py_zp)
-        ao_out = _GenericFakeQuantize.apply(ao_input, ao_s, ao_zp, qmin, qmax, block_size)
+        ao_out = _GenericFakeQuantize.apply(ao_input, block_size, ao_s, ao_zp, qmin, qmax)
         ao_out.sum().backward()
 
         torch.testing.assert_close(py_out, ao_out, atol=0, rtol=0)
