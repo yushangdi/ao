@@ -1,6 +1,7 @@
 import torch
 from typing import Tuple, Optional
 from torchao.quantization.quant_primitives import (
+    _get_and_check_qmin_qmax,
     choose_qparams_affine,
     fake_quantize_affine,
     ZeroPointDomain,
@@ -48,10 +49,10 @@ class AffineFakeQuantizedTensor(torch.Tensor):
         cls,
         float_data: torch.Tensor,
         fq_data: torch.Tensor,
-        dtype: torch.dtype = None,
     ):
         kwargs = {}
-        kwargs["dtype"] = dtype
+        kwargs["device"] = float_data.device
+        kwargs["dtype"] = float_data.dtype
         kwargs["requires_grad"] = True
         return torch.Tensor._make_wrapper_subclass(cls, float_data.shape, **kwargs)  # type: ignore[attr-defined]
 
@@ -59,13 +60,12 @@ class AffineFakeQuantizedTensor(torch.Tensor):
         self,
         float_data: torch.Tensor,
         fq_data: torch.Tensor,
-        dtype: torch.dtype = None,
     ):
         self.float_data = float_data
         self.fq_data = fq_data
 
     def __tensor_flatten__(self):
-        return ["float_data", "fq_data"], [self.dtype]
+        return ["float_data", "fq_data"], []
 
     @classmethod
     def __tensor_unflatten__(
@@ -73,8 +73,7 @@ class AffineFakeQuantizedTensor(torch.Tensor):
     ):
         float_data = tensor_data_dict["float_data"]
         fq_data = tensor_data_dict["fq_data"]
-        dtype, = tensor_attributes
-        return cls(float_data, fq_data, dtype)
+        return cls(float_data, fq_data)
 
     @classmethod
     def from_float(
@@ -91,6 +90,7 @@ class AffineFakeQuantizedTensor(torch.Tensor):
         preserve_zero: bool = True,
         zero_point_domain: ZeroPointDomain = ZeroPointDomain.INT,
     ):
+        quant_min, quant_max = _get_and_check_qmin_qmax(target_dtype, quant_min, quant_max)
         scale, zero_point = choose_qparams_affine(
             input_float,
             mapping_type,
@@ -113,7 +113,7 @@ class AffineFakeQuantizedTensor(torch.Tensor):
             quant_max,
             zero_point_domain,
         )
-        return cls(input_float, fq_data, input_float.dtype)
+        return cls(input_float, fq_data)
 
     def _get_to_kwargs(self, *args, **kwargs):
         device, dtype, _, memory_format = torch._C._nn._parse_to(*args, **kwargs)
@@ -141,7 +141,7 @@ class AffineFakeQuantizedTensor(torch.Tensor):
         )
 
     def _apply_fn_to_data(self, fn):
-        return self.__class__(self.float_data, fn(self.fq_data), self.dtype)
+        return self.__class__(self.float_data, fn(self.fq_data))
 
     implements = classmethod(_implements)
     __torch_function__ = classmethod(_dispatch__torch_function__)
@@ -157,6 +157,8 @@ def _(func, types, *args, **kwargs):
         args[1],
         args[2] if len(args) > 2 else None,
     )
+    if isinstance(input_tensor, AffineFakeQuantizedTensor):
+        input_tensor = input_tensor.fq_data
     if isinstance(weight_tensor, AffineFakeQuantizedTensor):
         weight_tensor = weight_tensor.fq_data
     return torch.nn.functional.linear(input_tensor, weight_tensor, bias)
@@ -171,6 +173,8 @@ def _(func, types, *args, **kwargs):
         input_index = 0
     input_tensor = args[input_index]
     weight_tensor = args[input_index + 1]
+    if isinstance(input_tensor, AffineFakeQuantizedTensor):
+        input_tensor = input_tensor.fq_data
     if isinstance(weight_tensor, AffineFakeQuantizedTensor):
         weight_tensor = weight_tensor.fq_data
     if bias is not None:

@@ -18,10 +18,14 @@ from torchao.quantization.GPTQ import (
     Int8DynActInt4WeightLinear,
     WeightOnlyInt4Linear,
 )
+from torchao.quantization.linear_activation_quantized_tensor import (
+    to_linear_activation_quantized,
+)
 from torchao.quantization.quant_api import (
     _get_linear_subclass_inserter,
     _replace_with_custom_fn_if_matches_filter,
     int4_weight_only,
+    int8_dynamic_activation_int4_weight,
     quantize_,
 )
 from torchao.quantization.quant_primitives import (
@@ -29,7 +33,10 @@ from torchao.quantization.quant_primitives import (
     ZeroPointDomain,
 )
 from torchao.quantization.unified import TwoStepQuantizer
-from torchao.quantization.utils import get_group_qparams_symmetric
+from torchao.quantization.utils import (
+    _get_per_token_block_size,
+    get_group_qparams_symmetric,
+)
 from .affine_fake_quantized_tensor import to_affine_fake_quantized
 from .utils import (
     _choose_qparams_per_token_asymmetric,
@@ -43,6 +50,54 @@ from .utils import (
 # =================
 # |   8da4w QAT   |
 # =================
+
+def int8_dynamic_activation_int4_weight_fake_quantize(group_size=32):
+    """
+    Applies int8 dynamic per token asymmetric activation fake quantization and
+    int4 per group weight symmetric fake quantization to linear. Please see
+    :func:`~torchao.quantization.int8_dynamic_activation_int4_weight` for more details.
+
+    Example usage:
+        from torchao.quantization import quantize_
+        quantize_(model, int8_dynamic_activation_int4_weight_fake_quantize(group_size=32))
+    """
+    def _apply_fake_quant(weight):
+        # avoid circular dep
+        from torchao.dtypes import to_affine_quantized
+
+        # weight settings
+        mapping_type = MappingType.SYMMETRIC
+        block_size = (1, group_size)
+        target_dtype = torch.int8
+        eps = torch.finfo(torch.float32).eps
+        quant_min = -8
+        quant_max = 7
+
+        # input settings
+        input_mapping_type = MappingType.ASYMMETRIC
+        input_target_dtype = torch.int8
+
+        def input_quant_func(x: torch.Tensor):
+            return to_affine_fake_quantized(
+                x,
+                input_mapping_type,
+                _get_per_token_block_size(x),
+                input_target_dtype,
+            )
+
+        weight = to_affine_fake_quantized(
+            weight,
+            mapping_type,
+            block_size,
+            target_dtype,
+            quant_min,
+            quant_max,
+            eps,
+        )
+        weight = to_linear_activation_quantized(weight, input_quant_func)
+        return weight
+
+    return _get_linear_subclass_inserter(_apply_fake_quant, requires_grad=True)
 
 class Int8DynActInt4WeightQATQuantizer(TwoStepQuantizer):
     """
@@ -70,14 +125,9 @@ class Int8DynActInt4WeightQATQuantizer(TwoStepQuantizer):
         *args: Any,
         **kwargs: Any
     ) -> torch.nn.Module:
-        _replace_linear_8da4w(
+        quantize_(
             model,
-            self.groupsize,
-            self.padding_allowed,
-            self.precision,
-            self.scales_precision,
-            Int8DynActInt4WeightQATLinear,
-            copy_weights=True,
+            int8_dynamic_activation_int4_weight_fake_quantize(group_size=self.groupsize),
         )
         return model
 
@@ -87,38 +137,12 @@ class Int8DynActInt4WeightQATQuantizer(TwoStepQuantizer):
         *args: Any,
         **kwargs: Any
     ) -> torch.nn.Module:
-        _convert_qat_linear_8da4w(model)
+        unwrap_fn = _get_linear_subclass_inserter(_unwrap_affine_fake_quantized_tensor)
+        filter_fn = _is_linear_with_fq_weight
+        model = _replace_with_custom_fn_if_matches_filter(model, unwrap_fn, filter_fn)
+        quantize_fn = int8_dynamic_activation_int4_weight(self.groupsize)
+        quantize_(model, quantize_fn)
         return model
-
-def _convert_qat_linear_8da4w(module: torch.nn.Module):
-    """
-    Replace all `Int8DynActInt4WeightQATLinear` with `Int8DynActInt4WeightLinear`.
-    """
-    for name, child in module.named_children():
-        if isinstance(child, Int8DynActInt4WeightQATLinear):
-            quantized_linear = Int8DynActInt4WeightLinear(
-                child.in_features,
-                child.out_features,
-                bias=False,
-                groupsize=child.groupsize,
-                precision=child.precision,
-                scales_precision=child.scales_precision,
-            )
-            setattr(module, name, quantized_linear)
-
-            # Load weights and qparams into quantized linear
-            n_bit = 4
-            (qmin, qmax) = child._get_qmin_qmax(n_bit)
-            (s, zp) = get_group_qparams_symmetric(child.weight, n_bit, child.groupsize)
-            from torchao._executorch_ops import _quantized_decomposed_quantize_per_channel_group_wrapper
-            q_weight = _quantized_decomposed_quantize_per_channel_group_wrapper(
-                child.weight, s, zp, qmin, qmax, torch.int8, child.groupsize,
-            )
-            quantized_linear.weight = q_weight
-            quantized_linear.scales = s
-            quantized_linear.zeros = zp
-        else:
-            _convert_qat_linear_8da4w(child)
 
 class Int8DynActInt4WeightQATLinear(torch.nn.Linear):
     """
@@ -295,10 +319,7 @@ class Int4WeightOnlyQATQuantizer(TwoStepQuantizer):
         unwrap_fn = _get_linear_subclass_inserter(_unwrap_affine_fake_quantized_tensor)
         filter_fn = _is_linear_with_fq_weight
         model = _replace_with_custom_fn_if_matches_filter(model, unwrap_fn, filter_fn)
-        quantize_fn = int4_weight_only(
-            group_size=self.groupsize,
-            inner_k_tiles=self.inner_k_tiles,
-        )
+        quantize_fn = int4_weight_only(self.groupsize, self.inner_k_tiles)
         quantize_(model, quantize_fn)
         return model
 
