@@ -143,3 +143,28 @@ def _choose_qparams_per_token_asymmetric(
     zero_point = torch.clamp(zero_point, qmin, qmax).round()
 
     return scale.to(scales_precision), zero_point.to(zero_points_precision)
+
+def _unwrap_affine_fake_quantized_tensor(t: torch.Tensor):
+    """
+    Return the original, non-fake-quantized float tensor from a `AffineFakeQuantizedTensor`.
+    """
+    # avoid circular dependencies
+    from torchao.quantization.prototype.qat.affine_fake_quantized_tensor import (
+        AffineFakeQuantizedTensor,
+    )
+    assert isinstance(t, AffineFakeQuantizedTensor)
+    return t.float_data
+
+def _is_linear_with_fq_weight(mod: torch.nn.Module, *args):
+    """
+    Return whether this is a nn.Linear module with `AffineFakeQuantizeTensor` weights.
+    """
+    # avoid circular dependencies
+    from torchao.quantization.prototype.qat.affine_fake_quantized_tensor import (
+        AffineFakeQuantizedTensor,
+    )
+    return (
+        isinstance(mod, torch.nn.Linear)
+        and hasattr(mod, "weight")
+        and isinstance(mod.weight, AffineFakeQuantizedTensor)
+    )

@@ -29,12 +29,13 @@ class AffineFakeQuantizedTensor(torch.Tensor):
     regardless of the internal representation's type or orientation.
 
     fields:
-      fq_data (torch.Tensor): actual tensor holding the fake quantized values
+      float_data (torch.Tensor): tensor holding the original float values, needed for actual quantization later
+      fq_data (torch.Tensor): tensor holding the fake quantized values
       block_size (Tuple[int, ...]): granularity of quantization, this means the size of the tensor elements that's sharing the same qparam
          e.g. when size is the same as the input tensor dimension, we are using per tensor quantization
       shape (torch.Size): the shape for the Tensor
-      quant_min (Optional[int]): minimum quantized value for the Tensor, if not specified, it will be derived from dtype of `int_data`
-      quant_max (Optional[int]): maximum quantized value for the Tensor, if not specified, it will be derived from dtype of `int_data`
+      quant_min (Optional[int]): minimum quantized value for the Tensor
+      quant_max (Optional[int]): maximum quantized value for the Tensor
       zero_point_domain (ZeroPointDomain): the domain that zero_point is in, should be eitehr integer or float
         if zero_point is in integer domain, zero point is added to the quantized integer value during quantization
         if zero_point is in floating point domain, zero point is subtracted from the floating point (unquantized)
@@ -45,53 +46,35 @@ class AffineFakeQuantizedTensor(torch.Tensor):
     @staticmethod
     def __new__(
         cls,
+        float_data: torch.Tensor,
         fq_data: torch.Tensor,
-        block_size: Tuple[int, ...],
-        shape: torch.Size,
-        quant_min: Optional[int] = None,
-        quant_max: Optional[int] = None,
-        zero_point_domain: ZeroPointDomain = ZeroPointDomain.INT,
         dtype: torch.dtype = None,
     ):
         kwargs = {}
         kwargs["dtype"] = dtype
         kwargs["requires_grad"] = True
-        return torch.Tensor._make_wrapper_subclass(cls, shape, **kwargs)  # type: ignore[attr-defined]
+        return torch.Tensor._make_wrapper_subclass(cls, float_data.shape, **kwargs)  # type: ignore[attr-defined]
 
     def __init__(
         self,
+        float_data: torch.Tensor,
         fq_data: torch.Tensor,
-        block_size: Tuple[int, ...],
-        shape: torch.Size,
-        quant_min: Optional[int] = None,
-        quant_max: Optional[int] = None,
-        zero_point_domain: ZeroPointDomain = ZeroPointDomain.INT,
         dtype: torch.dtype = None,
     ):
+        self.float_data = float_data
         self.fq_data = fq_data
-        self.block_size = block_size
-        self.quant_min = quant_min
-        self.quant_max = quant_max
-        self.zero_point_domain = zero_point_domain
 
     def __tensor_flatten__(self):
-        return ["fq_data"], [self.block_size, self.shape, self.quant_min, self.quant_max, self.zero_point_domain, self.dtype]
+        return ["float_data", "fq_data"], [self.dtype]
 
     @classmethod
     def __tensor_unflatten__(
         cls, tensor_data_dict, tensor_attributes, outer_size, outer_stride,
     ):
+        float_data = tensor_data_dict["float_data"]
         fq_data = tensor_data_dict["fq_data"]
-        block_size, shape, quant_min, quant_max, zero_point_domain, dtype = tensor_attributes
-        return cls(
-            fq_data,
-            block_size,
-            shape if outer_size is None else outer_size,
-            quant_min,
-            quant_max,
-            zero_point_domain,
-            dtype=dtype,
-        )
+        dtype, = tensor_attributes
+        return cls(float_data, fq_data, dtype)
 
     @classmethod
     def from_float(
@@ -108,7 +91,6 @@ class AffineFakeQuantizedTensor(torch.Tensor):
         preserve_zero: bool = True,
         zero_point_domain: ZeroPointDomain = ZeroPointDomain.INT,
     ):
-        original_shape = input_float.shape
         scale, zero_point = choose_qparams_affine(
             input_float,
             mapping_type,
@@ -131,15 +113,7 @@ class AffineFakeQuantizedTensor(torch.Tensor):
             quant_max,
             zero_point_domain,
         )
-        return cls(
-            fq_data,
-            block_size,
-            original_shape,
-            quant_min,
-            quant_max,
-            zero_point_domain,
-            dtype=input_float.dtype
-        )
+        return cls(input_float, fq_data, input_float.dtype)
 
     def _get_to_kwargs(self, *args, **kwargs):
         device, dtype, _, memory_format = torch._C._nn._parse_to(*args, **kwargs)
@@ -161,25 +135,13 @@ class AffineFakeQuantizedTensor(torch.Tensor):
         # not supported yet
         kwargs.pop("memory_format")
         return self.__class__(
+            self.float_data.to(device),
             self.fq_data.to(device),
-            self.block_size,
-            self.shape,
-            self.quant_min,
-            self.quant_max,
-            self.zero_point_domain,
             **kwargs,
         )
 
     def _apply_fn_to_data(self, fn):
-        return self.__class__(
-            fn(self.fq_data),
-            self.block_size,
-            self.shape,
-            self.quant_min,
-            self.quant_max,
-            self.zero_point_domain,
-            dtype=self.dtype,
-        )
+        return self.__class__(self.float_data, fn(self.fq_data), self.dtype)
 
     implements = classmethod(_implements)
     __torch_function__ = classmethod(_dispatch__torch_function__)

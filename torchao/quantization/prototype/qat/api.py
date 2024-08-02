@@ -20,6 +20,8 @@ from torchao.quantization.GPTQ import (
 )
 from torchao.quantization.quant_api import (
     _get_linear_subclass_inserter,
+    _replace_with_custom_fn_if_matches_filter,
+    int4_weight_only,
     quantize_,
 )
 from torchao.quantization.quant_primitives import (
@@ -33,6 +35,8 @@ from .utils import (
     _choose_qparams_per_token_asymmetric,
     _fake_quantize_per_channel_group,
     _fake_quantize_per_token,
+    _is_linear_with_fq_weight,
+    _unwrap_affine_fake_quantized_tensor,
 )
 
 
@@ -279,16 +283,7 @@ class Int4WeightOnlyQATQuantizer(TwoStepQuantizer):
         *args: Any,
         **kwargs: Any
     ) -> torch.nn.Module:
-        _replace_linear_int4(
-            model,
-            self.groupsize,
-            self.inner_k_tiles,
-            padding_allowed=True,
-            precision=self.precision,
-            scales_precision=self.scales_precision,
-            linear_class=Int4WeightOnlyQATLinear,
-            copy_weights=True,
-        )
+        quantize_(model, int4_weight_only_fake_quantize(group_size=self.groupsize))
         return model
 
     def convert(
@@ -297,42 +292,16 @@ class Int4WeightOnlyQATQuantizer(TwoStepQuantizer):
         *args: Any,
         **kwargs: Any
     ) -> torch.nn.Module:
-        _convert_qat_linear_4w(model)
+        unwrap_fn = _get_linear_subclass_inserter(_unwrap_affine_fake_quantized_tensor)
+        filter_fn = _is_linear_with_fq_weight
+        model = _replace_with_custom_fn_if_matches_filter(model, unwrap_fn, filter_fn)
+        quantize_fn = int4_weight_only(
+            group_size=self.groupsize,
+            inner_k_tiles=self.inner_k_tiles,
+        )
+        quantize_(model, quantize_fn)
         return model
 
-def _convert_qat_linear_4w(module: torch.nn.Module):
-    """
-    Replace all `Int4WeightOnlyQATLinear` with `WeightOnlyInt4Linear`.
-    """
-    for name, child in module.named_children():
-        if isinstance(child, Int4WeightOnlyQATLinear):
-            in_features = child.in_features
-            out_features = child.out_features
-            groupsize = child.groupsize
-            inner_k_tiles = child.inner_k_tiles
-            quantized_linear = WeightOnlyInt4Linear(
-                in_features,
-                out_features,
-                bias=False,
-                groupsize=groupsize,
-                inner_k_tiles=inner_k_tiles,
-                precision=child.precision,
-                scales_precision=child.scales_precision,
-            )
-            setattr(module, name, quantized_linear)
-
-            # Load weights and qparams into quantized linear
-            n_bit = 4
-            (q_weight, scales_and_zeros) = groupwise_affine_quantize_tensor(
-                child.weight, n_bit, child.groupsize,
-            )
-            q_weight = torch.ops.aten._convert_weight_to_int4pack(
-                q_weight.to(child.weight.device), child.inner_k_tiles,
-            )
-            quantized_linear.weight = q_weight
-            quantized_linear.scales_and_zeros = scales_and_zeros
-        else:
-            _convert_qat_linear_4w(child)
 
 class Int4WeightOnlyQATLinear(torch.nn.Linear):
     """
