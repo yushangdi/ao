@@ -178,7 +178,7 @@ implements = AffineFakeQuantizedTensor.implements
 
 
 @implements(torch.nn.functional.linear)
-def _(func, types, *args, **kwargs):
+def _(func, types, args, kwargs):
     input_tensor, weight_tensor, bias = (
         args[0],
         args[1],
@@ -192,7 +192,7 @@ def _(func, types, *args, **kwargs):
 
 
 @implements([aten.mm.default, aten.addmm.default])
-def _(func, types, *args, **kwargs):
+def _(func, types, args, kwargs):
     if func == aten.addmm.default:
         bias = args[0]
         input_tensor = args[1]
@@ -212,21 +212,21 @@ def _(func, types, *args, **kwargs):
 
 
 @implements([aten.detach.default])
-def _(func, types, *args, **kwargs):
+def _(func, types, args, kwargs):
     return return_and_correct_aliasing(
         func, args, kwargs, args[0]._apply_fn_to_data(torch.detach),
     )
 
 
 @implements([aten.clone.default])
-def _(func, types, *args, **kwargs):
+def _(func, types, args, kwargs):
     return return_and_correct_aliasing(
         func, args, kwargs, args[0]._apply_fn_to_data(torch.clone),
     )
 
 
 @implements([aten.t.default])
-def _(func, types, *args, **kwargs):
+def _(func, types, args, kwargs):
     return return_and_correct_aliasing(
         func, args, kwargs, args[0]._apply_fn_to_data(torch.t),
     )
@@ -237,7 +237,7 @@ def _(func, types, *args, **kwargs):
     aten.add_.Tensor,
     aten.mul_.Tensor,
 ])
-def _(func, types, *args, **kwargs):
+def _(func, types, args, kwargs):
     assert len(args) == 2, f"dispatched the wrong op to the binary handler: {func}"
     new_args = pytree.tree_map_only(AffineFakeQuantizedTensor, lambda x: x.original_tensor, args)
     first_afq_tensor = args[0] if isinstance(args[0], AffineFakeQuantizedTensor) else args[1]
