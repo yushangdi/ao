@@ -260,9 +260,30 @@ def swap_conv2d_1x1_to_linear(model, filter_fn=None):
     )
 
 
-def _get_linear_subclass_inserter(constructor, requires_grad=False):
+def _get_linear_subclass_inserter(
+    weight_constructor: Callable,
+    input_constructor: Optional[Callable] = None,
+    forward_pre_hook_handler: Optional[Callable] = None,
+    requires_grad: bool = False,
+) -> Callable:
+    """
+    Return a functinon that inserts wraps the weight and/or input activation of a
+    linear module in tensor subclasses.
+
+    Args:
+        weight_constructor: constructor of the weight subclass, accepts a tensor
+        input_constructor: (optional) constructor of the input subclass, accepts a tensor
+        forward_pre_hook_handler: (optional) a handler function that accepts as arguments:
+            (the linear module, prehook function, prehook handler)
+        requires_grad: whether the weight parameter requires gradients (defaults to False)
+    """
     def insert_subclass(lin):
-        lin.weight = torch.nn.Parameter(constructor(lin.weight), requires_grad=requires_grad)
+        lin.weight = torch.nn.Parameter(weight_constructor(lin.weight), requires_grad=requires_grad)
+        if input_constructor is not None:
+            prehook = lambda _, args: tuple([input_constructor(args[0])] + list(args[1:]))
+            handle = lin.register_forward_pre_hook(prehook)
+            if forward_pre_hook_handler is not None:
+                forward_pre_hook_handler(lin, prehook, handle)
         return lin
 
     return insert_subclass

@@ -43,6 +43,7 @@ from .utils import (
     _enable_fake_quant,
     _fake_quantize_per_channel_group,
     _fake_quantize_per_token,
+    _forward_pre_hook_handler,
     _is_linear_with_fq_weight,
     _unwrap_affine_fake_quantized_tensor,
 )
@@ -62,31 +63,17 @@ def int8_dynamic_activation_int4_weight_fake_quantize(group_size=32):
         from torchao.quantization import quantize_
         quantize_(model, int8_dynamic_activation_int4_weight_fake_quantize(group_size=32))
     """
-    def _apply_fake_quant(weight):
-        # avoid circular dep
-        from torchao.dtypes import to_affine_quantized
+    # avoid circular dep
+    from torchao.dtypes import to_affine_quantized
 
-        # weight settings
+    def _apply_weight_fake_quant(weight: torch.Tensor):
         mapping_type = MappingType.SYMMETRIC
         block_size = (1, group_size)
         target_dtype = torch.int8
         eps = torch.finfo(torch.float32).eps
         quant_min = -8
         quant_max = 7
-
-        # input settings
-        input_mapping_type = MappingType.ASYMMETRIC
-        input_target_dtype = torch.int8
-
-        def input_quant_func(x: torch.Tensor):
-            return to_affine_fake_quantized(
-                x,
-                input_mapping_type,
-                _get_per_token_block_size(x),
-                input_target_dtype,
-            )
-
-        weight = to_affine_fake_quantized(
+        return to_affine_fake_quantized(
             weight,
             mapping_type,
             block_size,
@@ -95,10 +82,23 @@ def int8_dynamic_activation_int4_weight_fake_quantize(group_size=32):
             quant_max,
             eps,
         )
-        weight = to_linear_activation_quantized(weight, input_quant_func)
-        return weight
 
-    return _get_linear_subclass_inserter(_apply_fake_quant, requires_grad=True)
+    def _apply_input_activation_fake_quant(x: torch.Tensor):
+        mapping_type = MappingType.ASYMMETRIC
+        target_dtype = torch.int8
+        return to_affine_fake_quantized(
+            x,
+            mapping_type,
+            _get_per_token_block_size(x),
+            target_dtype,
+        )
+
+    return _get_linear_subclass_inserter(
+        _apply_weight_fake_quant,
+        _apply_input_activation_fake_quant,
+        forward_pre_hook_handler=_forward_pre_hook_handler,
+        requires_grad=True,
+    )
 
 class Int8DynActInt4WeightQATQuantizer(TwoStepQuantizer):
     """

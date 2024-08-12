@@ -4,7 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import List, Tuple
+from typing import Callable, List, Tuple
 
 import torch
 
@@ -15,6 +15,15 @@ from torchao.quantization.quant_primitives import (
 from torchao.quantization.utils import (
     _get_per_token_block_size,
 )
+
+
+# Attribute name representing the forward prehook wrapping the
+# linear input in an `AffineFakeQuantizedTensor` on a linear module.
+#
+# The value of this attribute is a 2-tuple of (prehook, handle).
+# The prehook can be disabled by calling `handle.remove()`, and
+# re-enabled by calling `module.register_forward_pre_hook(prehook)`.
+_QAT_LINEAR_SUBCLASS_INPUT_PREHOOK = "_qat_linear_subclass_input_prehook"
 
 
 class _GenericFakeQuantize(torch.autograd.Function):
@@ -146,19 +155,24 @@ def _choose_qparams_per_token_asymmetric(
 
     return scale.to(scales_precision), zero_point.to(zero_points_precision)
 
+def _forward_pre_hook_handler(
+    mod: torch.nn.Linear,
+    prehook: Callable,
+    handler: torch.utils.hooks.RemovableHandle,
+):
+    """
+    Store a 2-tuple (prehook function, handler) as an attribute on the given linear module.
+    """
+    setattr(mod, _QAT_LINEAR_SUBCLASS_INPUT_PREHOOK, (prehook, handler))
+
 def _unwrap_affine_fake_quantized_tensor(t: torch.Tensor):
     """
     Return the original, non-fake-quantized float tensor from a `AffineFakeQuantizedTensor`.
     """
     # avoid circular dependencies
-    from torchao.quantization.linear_activation_quantized_tensor import (
-        LinearActivationQuantizedTensor,
-    )
     from torchao.quantization.prototype.qat.affine_fake_quantized_tensor import (
         AffineFakeQuantizedTensor,
     )
-    if isinstance(t, LinearActivationQuantizedTensor):
-        t = t.original_weight_tensor
     assert isinstance(t, AffineFakeQuantizedTensor)
     return t.original_tensor
 
@@ -167,34 +181,33 @@ def _is_linear_with_fq_weight(mod: torch.nn.Module, *args):
     Return whether this is a nn.Linear module with `AffineFakeQuantizeTensor` weights.
     """
     # avoid circular dependencies
-    from torchao.quantization.linear_activation_quantized_tensor import (
-        LinearActivationQuantizedTensor,
-    )
     from torchao.quantization.prototype.qat.affine_fake_quantized_tensor import (
         AffineFakeQuantizedTensor,
     )
     if not isinstance(mod, torch.nn.Linear) or not hasattr(mod, "weight"):
         return False
     weight = mod.weight
-    if isinstance(weight, LinearActivationQuantizedTensor):
-        weight = weight.original_weight_tensor
     return isinstance(weight, AffineFakeQuantizedTensor)
 
 def _enable_fake_quant(mod: torch.nn.Module, enable: bool):
     """
     Enable or disable fake quantization in the activations and weights of a `nn.Linear` module.
     """
-    from torchao.quantization.linear_activation_quantized_tensor import (
-        LinearActivationQuantizedTensor,
-    )
     from torchao.quantization.prototype.qat.affine_fake_quantized_tensor import (
         AffineFakeQuantizedTensor,
     )
     if not _is_linear_with_fq_weight(mod):
         return
     weight = mod.weight
-    if isinstance(weight, LinearActivationQuantizedTensor):
-        weight.input_quant_func_enabled = enable
-        weight = weight.original_weight_tensor
     assert isinstance(weight, AffineFakeQuantizedTensor)
     weight.fake_quant_enabled = enable
+
+    # Enable/disable input fake quant
+    if hasattr(mod, _QAT_LINEAR_SUBCLASS_INPUT_PREHOOK):
+        (prehook, handle) = getattr(mod, _QAT_LINEAR_SUBCLASS_INPUT_PREHOOK)
+        if enable:
+            handle = mod.register_forward_pre_hook(prehook)
+        else:
+            handle.remove()
+            handle = None
+        _forward_pre_hook_handler(mod, prehook, handle)

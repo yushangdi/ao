@@ -12,9 +12,6 @@ import unittest
 
 import torch
 from torch.ao.quantization.fx._decomposed import quantized_decomposed_lib  # noqa: F401
-from torchao.quantization.linear_activation_quantized_tensor import (
-    LinearActivationQuantizedTensor,
-)
 from torchao.quantization.prototype.qat.affine_fake_quantized_tensor import (
     AffineFakeQuantizedTensor,
 )
@@ -23,6 +20,7 @@ from torchao.quantization.prototype.qat.utils import (
     _fake_quantize_per_channel_group,
     _fake_quantize_per_token,
     _GenericFakeQuantize,
+    _QAT_LINEAR_SUBCLASS_INPUT_PREHOOK,
 )
 from torchao.quantization.quant_api import (
     int4_weight_only,
@@ -259,11 +257,14 @@ class TestQAT(unittest.TestCase):
         )
 
         def assert_fake_quant_enabled(m: torch.nn.Linear, enabled: bool):
-            assert isinstance(m.weight, LinearActivationQuantizedTensor)
-            self.assertEqual(m.weight.input_quant_func_enabled, enabled)
-            weight = m.weight.original_weight_tensor
-            self.assertTrue(isinstance(weight, AffineFakeQuantizedTensor))
-            self.assertEqual(weight.fake_quant_enabled, enabled)
+            self.assertTrue(isinstance(m.weight, AffineFakeQuantizedTensor))
+            self.assertEqual(m.weight.fake_quant_enabled, enabled)
+            self.assertTrue(hasattr(m, _QAT_LINEAR_SUBCLASS_INPUT_PREHOOK))
+            (_, handle) = getattr(m, _QAT_LINEAR_SUBCLASS_INPUT_PREHOOK)
+            if enabled:
+                self.assertIsNotNone(handle)
+            else:
+                self.assertIsNone(handle)
 
         group_size = 16
         torch.manual_seed(self.SEED)
@@ -278,9 +279,9 @@ class TestQAT(unittest.TestCase):
         assert_fake_quant_enabled(qat_model.sub.linear, enabled=False)
 
         # Disabled fake quant is just a normal linear
-        m2.linear1.weight = qat_model.linear1.weight
-        m2.linear2.weight = qat_model.linear2.weight
-        m2.sub.linear.weight = qat_model.sub.linear.weight
+        m2.linear1.weight = torch.nn.Parameter(qat_model.linear1.weight.original_tensor)
+        m2.linear2.weight = torch.nn.Parameter(qat_model.linear2.weight.original_tensor)
+        m2.sub.linear.weight = torch.nn.Parameter(qat_model.sub.linear.weight.original_tensor)
         torch.manual_seed(self.SEED)
         x = m.example_inputs()
         x2 = copy.deepcopy(x)
@@ -297,9 +298,9 @@ class TestQAT(unittest.TestCase):
         # Fake quant should be applied as normal
         quantizer2 = Int8DynActInt4WeightQATQuantizer(groupsize=group_size)
         qat_model2 = quantizer2.prepare(m3)
-        qat_model2.linear1.weight = qat_model.linear1.weight
-        qat_model2.linear2.weight = qat_model.linear2.weight
-        qat_model2.sub.linear.weight = qat_model.sub.linear.weight
+        qat_model2.linear1.weight.original_tensor = qat_model.linear1.weight.original_tensor
+        qat_model2.linear2.weight.original_tensor = qat_model.linear2.weight.original_tensor
+        qat_model2.sub.linear.weight.original_tensor = qat_model.sub.linear.weight.original_tensor
         torch.manual_seed(self.SEED)
         x = m.example_inputs()
         x2 = copy.deepcopy(x)
@@ -318,9 +319,8 @@ class TestQAT(unittest.TestCase):
         )
 
         def get_qat_weight(qat_linear: torch.nn.Linear):
-            assert isinstance(qat_linear.weight, LinearActivationQuantizedTensor)
-            assert isinstance(qat_linear.weight.original_weight_tensor, AffineFakeQuantizedTensor)
-            return qat_linear.weight.original_weight_tensor.original_tensor
+            assert isinstance(qat_linear.weight, AffineFakeQuantizedTensor)
+            return qat_linear.weight.original_tensor
 
         group_size = 16
         torch.manual_seed(self.SEED)
