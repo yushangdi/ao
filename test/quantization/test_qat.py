@@ -198,6 +198,7 @@ class TestQAT(unittest.TestCase):
         ptq_out = ptq_linear(x2)
         torch.testing.assert_close(ptq_out, qat_out, atol=0, rtol=0)
 
+    # TODO: compare against quantize_ API instead
     @unittest.skipIf(not TORCH_VERSION_AFTER_2_4, "skipping when torch version is 2.4 or lower")
     def test_qat_8da4w_quantizer(self):
         from torchao.quantization.prototype.qat import Int8DynActInt4WeightQATQuantizer
@@ -225,14 +226,6 @@ class TestQAT(unittest.TestCase):
         converted_out = converted_model(*x)
         torch.testing.assert_close(ptq_out, converted_out, atol=0, rtol=0)
 
-        # TODO: enable this after supporting aten.eq.default in both subclasses
-        # Compare converted state dict
-        # ptq_state_dict = ptq_model.state_dict()
-        # converted_state_dict = converted_model.state_dict()
-        # self.assertEqual(ptq_state_dict.keys(), converted_state_dict.keys())
-        # for k in ptq_state_dict.keys():
-        #     torch.testing.assert_close(ptq_state_dict[k], converted_state_dict[k], atol=0, rtol=0)
-
     @unittest.skipIf(not TORCH_VERSION_AFTER_2_4, "skipping when torch version is 2.4 or lower")
     def test_qat_8da4w_quantizer_meta_weights(self):
         from torchao.quantization.prototype.qat import Int8DynActInt4WeightQATQuantizer
@@ -244,6 +237,20 @@ class TestQAT(unittest.TestCase):
         qat_quantizer = Int8DynActInt4WeightQATQuantizer(groupsize=group_size)
         qat_model = qat_quantizer.prepare(m)
         self.assertTrue(all(v.is_meta for v in qat_model.state_dict().values()))
+
+    def _copy_subclass_weights(
+        self,
+        nn_linear: torch.nn.Linear,
+        subclass_linear: AffineFakeQuantizedTensor,
+    ):
+        nn_linear.weight = torch.nn.Parameter(subclass_linear.weight.original_tensor)
+
+    def _assert_matches_subclass_weights(
+        self,
+        nn_linear: torch.nn.Linear,
+        subclass_linear: AffineFakeQuantizedTensor,
+    ):
+        torch.testing.assert_close(nn_linear.weight, subclass_linear.weight.original_tensor, atol=0, rtol=0)
 
     @unittest.skipIf(not TORCH_VERSION_AFTER_2_4, "skipping when torch version is 2.4 or lower")
     def test_qat_8da4w_quantizer_disable_fake_quant(self):
@@ -279,9 +286,9 @@ class TestQAT(unittest.TestCase):
         assert_fake_quant_enabled(qat_model.sub.linear, enabled=False)
 
         # Disabled fake quant is just a normal linear
-        m2.linear1.weight = torch.nn.Parameter(qat_model.linear1.weight.original_tensor)
-        m2.linear2.weight = torch.nn.Parameter(qat_model.linear2.weight.original_tensor)
-        m2.sub.linear.weight = torch.nn.Parameter(qat_model.sub.linear.weight.original_tensor)
+        self._copy_subclass_weights(m2.linear1, qat_model.linear1)
+        self._copy_subclass_weights(m2.linear2, qat_model.linear2)
+        self._copy_subclass_weights(m2.sub.linear, qat_model.sub.linear)
         torch.manual_seed(self.SEED)
         x = m.example_inputs()
         x2 = copy.deepcopy(x)
@@ -318,10 +325,6 @@ class TestQAT(unittest.TestCase):
             disable_8da4w_fake_quant,
         )
 
-        def get_qat_weight(qat_linear: torch.nn.Linear):
-            assert isinstance(qat_linear.weight, AffineFakeQuantizedTensor)
-            return qat_linear.weight.original_tensor
-
         group_size = 16
         torch.manual_seed(self.SEED)
         m = M()
@@ -329,9 +332,9 @@ class TestQAT(unittest.TestCase):
         quantizer = Int8DynActInt4WeightQATQuantizer(groupsize=group_size)
         qat_model = quantizer.prepare(m)
         qat_model.apply(disable_8da4w_fake_quant)
-        nn_model.linear1.weight = torch.nn.Parameter(get_qat_weight(qat_model.linear1))
-        nn_model.linear2.weight = torch.nn.Parameter(get_qat_weight(qat_model.linear2))
-        nn_model.sub.linear.weight = torch.nn.Parameter(get_qat_weight(qat_model.sub.linear))
+        self._copy_subclass_weights(nn_model.linear1, qat_model.linear1)
+        self._copy_subclass_weights(nn_model.linear2, qat_model.linear2)
+        self._copy_subclass_weights(nn_model.sub.linear, qat_model.sub.linear)
 
         # Simulate training for both models
         optimizer1 = torch.optim.SGD(nn_model.parameters(), lr=0.001, momentum=0.9, weight_decay=1e-5)
@@ -353,9 +356,9 @@ class TestQAT(unittest.TestCase):
         optimizer2.step()
 
         # After 1 training step, weights should match exactly
-        torch.testing.assert_close(nn_model.linear1.weight, get_qat_weight(qat_model.linear1), atol=0, rtol=0)
-        torch.testing.assert_close(nn_model.linear2.weight, get_qat_weight(qat_model.linear2), atol=0, rtol=0)
-        torch.testing.assert_close(nn_model.sub.linear.weight, get_qat_weight(qat_model.sub.linear), atol=0, rtol=0)
+        self._assert_matches_subclass_weights(nn_model.linear1, qat_model.linear1)
+        self._assert_matches_subclass_weights(nn_model.linear2, qat_model.linear2)
+        self._assert_matches_subclass_weights(nn_model.sub.linear, qat_model.sub.linear)
 
     @unittest.skipIf(not TORCH_VERSION_AFTER_2_4, "skipping when torch version is 2.4 or lower")
     def test_qat_generic_fake_quantize(self):
@@ -396,6 +399,7 @@ class TestQAT(unittest.TestCase):
         print(mean_err)
         self.assertTrue(mean_err < 0.05)
 
+    # TODO: compare against quantize_ API instead
     @unittest.skipIf(not TORCH_VERSION_AFTER_2_4, "skipping when torch version is 2.4 or lower")
     @unittest.skipIf(not _CUDA_IS_AVAILABLE, "skipping when cuda is not available")
     def test_qat_4w_quantizer(self):
@@ -428,14 +432,6 @@ class TestQAT(unittest.TestCase):
         converted_model = qat_quantizer.convert(qat_model)
         converted_out = converted_model(*x)
         torch.testing.assert_close(converted_out, ptq_out, atol=0, rtol=0)
-
-        # TODO: enable this after supporting aten.eq.default in both subclasses
-        # Compare converted state dict
-        # ptq_state_dict = ptq_model.state_dict()
-        # converted_state_dict = converted_model.state_dict()
-        # self.assertEqual(ptq_state_dict.keys(), converted_state_dict.keys())
-        # for k in ptq_state_dict.keys():
-        #     torch.testing.assert_close(ptq_state_dict[k], converted_state_dict[k], atol=0, rtol=0)
 
 
 if __name__ == "__main__":

@@ -145,6 +145,7 @@ class Int8DynActInt4WeightQATQuantizer(TwoStepQuantizer):
         quantize_(model, quantize_fn)
         return model
 
+# TODO: deprecate
 class Int8DynActInt4WeightQATLinear(torch.nn.Linear):
     """
     This module implements a linear layer with int8 dynamic per token fake
@@ -322,7 +323,7 @@ class Int4WeightOnlyQATQuantizer(TwoStepQuantizer):
         quantize_(model, quantize_fn)
         return model
 
-
+# TODO: deprecate
 class Int4WeightOnlyQATLinear(torch.nn.Linear):
     """
     This module implements a linear layer with int4 fake quantized grouped

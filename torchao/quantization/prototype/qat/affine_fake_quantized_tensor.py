@@ -14,7 +14,10 @@ from torchao.dtypes.utils import (
     _dispatch__torch_function__,
     _dispatch__torch_dispatch__,
 )
-from .utils import _GenericFakeQuantize
+from .utils import (
+    _GenericFakeQuantize,
+    _UnwrapAffineFakeQuantizedTensor,
+)
 
 aten = torch.ops.aten
 
@@ -129,7 +132,7 @@ class AffineFakeQuantizedTensor(torch.Tensor):
         if self.fake_quant_enabled:
             return self.apply_fake_quant_fn(self)
         else:
-            return self.original_tensor
+            return _UnwrapAffineFakeQuantizedTensor.apply(self)
 
     def _get_to_kwargs(self, *args, **kwargs):
         device, dtype, _, memory_format = torch._C._nn._parse_to(*args, **kwargs)

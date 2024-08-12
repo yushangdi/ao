@@ -267,7 +267,7 @@ def _get_linear_subclass_inserter(
     requires_grad: bool = False,
 ) -> Callable:
     """
-    Return a functinon that inserts wraps the weight and/or input activation of a
+    Return a function that inserts wraps the weight and/or input activation of a
     linear module in tensor subclasses.
 
     Args:

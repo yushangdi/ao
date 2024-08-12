@@ -73,6 +73,31 @@ class _GenericFakeQuantize(torch.autograd.Function):
         (mask,) = ctx.saved_tensors
         return gy * mask, None, None, None, None, None, None
 
+
+class _UnwrapAffineFakeQuantizedTensor(torch.autograd.Function):
+    """
+    Helper autograd function to unwrap `AffineFakeQuantizedTensor` while ensuring
+    gradients are still passed to the tensor subclass. This is used in place of
+    `_GenericFakeQuantize` when fake quant is disabled.
+    """
+
+    @staticmethod
+    def forward(
+        ctx: torch.autograd.function.FunctionCtx,
+        input: torch.Tensor,
+    ) -> torch.Tensor:
+        # avoid circular dependencies
+        from torchao.quantization.prototype.qat.affine_fake_quantized_tensor import (
+            AffineFakeQuantizedTensor,
+        )
+        assert isinstance(input, AffineFakeQuantizedTensor)
+        return input.original_tensor
+
+    @staticmethod
+    def backward(ctx, gy):
+        return gy,
+
+
 def _fake_quantize_per_channel_group(
     input: torch.Tensor,
     scales: torch.Tensor,
@@ -206,8 +231,9 @@ def _enable_fake_quant(mod: torch.nn.Module, enable: bool):
     if hasattr(mod, _QAT_LINEAR_SUBCLASS_INPUT_PREHOOK):
         (prehook, handle) = getattr(mod, _QAT_LINEAR_SUBCLASS_INPUT_PREHOOK)
         if enable:
-            handle = mod.register_forward_pre_hook(prehook)
+            if handle is None:
+                handle = mod.register_forward_pre_hook(prehook)
+                _forward_pre_hook_handler(mod, prehook, handle)
         else:
             handle.remove()
-            handle = None
-        _forward_pre_hook_handler(mod, prehook, handle)
+            _forward_pre_hook_handler(mod, prehook, None)
