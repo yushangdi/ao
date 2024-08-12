@@ -23,7 +23,6 @@ class LinearActivationQuantizedTensor(torch.Tensor):
         cls,
         original_weight_tensor: torch.Tensor,
         input_quant_func: Callable,
-        input_quant_func_enabled: bool = True,
     ):
         kwargs = {}
         dtype = original_weight_tensor.dtype
@@ -37,34 +36,32 @@ class LinearActivationQuantizedTensor(torch.Tensor):
         self,
         original_weight_tensor: torch.Tensor,
         input_quant_func: Callable,
-        input_quant_func_enabled: bool = True,
     ):
         self.original_weight_tensor = original_weight_tensor
         self.input_quant_func = input_quant_func
-        self.input_quant_func_enabled = input_quant_func_enabled
 
     def __repr__(self):
         return f"LinearActivationQuantizedTensor({self.original_weight_tensor}, {self.input_quant_func})"
 
     def __tensor_flatten__(self):
-        return ["original_weight_tensor"], [self.input_quant_func, self.input_quant_func_enabled]
+        return ["original_weight_tensor"], [self.input_quant_func]
 
     @classmethod
     def __tensor_unflatten__(
         cls, tensor_data_dict, tensor_attributes, outer_size, outer_stride
     ):
         original_weight_tensor = tensor_data_dict["original_weight_tensor"]
-        (input_quant_func, input_quant_func_enabled) = tensor_attributes
+        input_quant_func, = tensor_attributes
         return cls(
             original_weight_tensor,
             input_quant_func,
-            input_quant_func_enabled,
         )
 
     @staticmethod
     def _quantized_linear_op(input_tensor, weight_tensor, bias):
+        input_quant_func = weight_tensor.input_quant_func
         original_weight_tensor = weight_tensor.original_weight_tensor
-        aqt = weight_tensor.apply_input_quant_func(input_tensor)
+        aqt = input_quant_func(input_tensor)
         return torch.nn.functional.linear(aqt, original_weight_tensor, bias)
 
     @classmethod
@@ -75,14 +72,7 @@ class LinearActivationQuantizedTensor(torch.Tensor):
         return self.__class__(
             fn(self.original_weight_tensor),
             self.input_quant_func,
-            self.input_quant_func_enabled,
         )
-
-    def apply_input_quant_func(self, t: torch.Tensor):
-        if self.input_quant_func_enabled:
-            return self.input_quant_func(t)
-        else:
-            return t
 
     def _get_to_kwargs(self, *args, **kwargs):
         device, dtype, _, memory_format = torch._C._nn._parse_to(*args, **kwargs)
@@ -103,7 +93,6 @@ class LinearActivationQuantizedTensor(torch.Tensor):
         return self.__class__(
             self.original_weight_tensor.to(**kwargs),
             self.input_quant_func,
-            self.input_quant_func_enabled,
         )
 
     implements = classmethod(_implements)
@@ -139,8 +128,9 @@ def _(func, types, args, kwargs):
             args[2],
             args[0],
         )
+        input_quant_func = weight_tensor.input_quant_func
         original_weight_tensor = weight_tensor.original_weight_tensor
-        aqt = weight_tensor.apply_input_quant_func(input_tensor)
+        aqt = input_quant_func(input_tensor)
         return func(bias, aqt, original_weight_tensor)
     else:
         # aten.mm.default
@@ -152,8 +142,9 @@ def _(func, types, args, kwargs):
             args[0],
             args[1],
         )
+        input_quant_func = weight_tensor.input_quant_func
         original_weight_tensor = weight_tensor.original_weight_tensor
-        aqt = weight_tensor.apply_input_quant_func(input_tensor)
+        aqt = input_quant_func(input_tensor)
         return func(aqt, original_weight_tensor)
 
 
