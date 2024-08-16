@@ -161,13 +161,20 @@ class AffineFakeQuantizedTensor(torch.Tensor):
             **kwargs,
         )
 
-    def _apply_fn_to_data(self, fn):
+    def _apply_fn_to_data(self, fn: Callable):
         """
         Create a new `AffineFakeQuantizedTensor` with `fn` applied to the
         original tensor, to be called within __torch_dispatch__.
         """
+        return self._create_new(fn(self.original_tensor))
+
+    def _create_new(self, new_value: torch.Tensor):
+        """
+        Create a new `AffineFakeQuantizedTensor` with a new value,
+        to be called within __torch_dispatch__.
+        """
         return self.__class__(
-            fn(self.original_tensor),
+            new_value,
             self.apply_fake_quant_fn,
             self.fake_quant_enabled,
             requires_grad=False,
@@ -214,21 +221,21 @@ def _(func, types, args, kwargs):
         return func(input_tensor, weight_tensor)
 
 
-@implements([aten.detach.default])
+@implements(aten.detach.default)
 def _(func, types, args, kwargs):
     return return_and_correct_aliasing(
         func, args, kwargs, args[0]._apply_fn_to_data(torch.detach),
     )
 
 
-@implements([aten.clone.default])
+@implements(aten.clone.default)
 def _(func, types, args, kwargs):
     return return_and_correct_aliasing(
         func, args, kwargs, args[0]._apply_fn_to_data(torch.clone),
     )
 
 
-@implements([aten.t.default])
+@implements(aten.t.default)
 def _(func, types, args, kwargs):
     return return_and_correct_aliasing(
         func, args, kwargs, args[0]._apply_fn_to_data(torch.t),
@@ -239,15 +246,40 @@ def _(func, types, args, kwargs):
     aten.add.Tensor,
     aten.add_.Tensor,
     aten.mul_.Tensor,
+    aten.copy_.default,
 ])
 def _(func, types, args, kwargs):
     assert len(args) == 2, f"dispatched the wrong op to the binary handler: {func}"
     new_args = pytree.tree_map_only(AffineFakeQuantizedTensor, lambda x: x.original_tensor, args)
     first_afq_tensor = args[0] if isinstance(args[0], AffineFakeQuantizedTensor) else args[1]
-    fn = lambda x: func(*new_args, **kwargs)
-    return return_and_correct_aliasing(
-        func, args, kwargs, first_afq_tensor._apply_fn_to_data(fn),
-    )
+    new_value = func(*new_args, **kwargs)
+    out = first_afq_tensor._create_new(new_value)
+    return return_and_correct_aliasing(func, args, kwargs, out)
+
+
+# Needed by FSDP:
+
+@implements(aten.empty_like.default)
+def _(func, types, args, kwargs):
+    out = torch.empty_like(args[0].original_tensor, **kwargs)
+    return return_and_correct_aliasing(func, args, kwargs, out)
+
+
+@implements(aten.split.Tensor)
+def _(func, types, args, kwargs):
+    new_values = torch.split(args[0].original_tensor, *args[1:], **kwargs)
+
+    def make_new_tensor(value):
+        out = args[0]._create_new(value)
+        return return_and_correct_aliasing(func, args, kwargs, out)
+
+    return list(map(make_new_tensor, new_values))
+
+
+@implements(aten.new_zeros.default)
+def _(func, types, args, kwargs):
+    out = args[0].original_tensor.new_zeros(*args[1:], **kwargs)
+    return return_and_correct_aliasing(func, args, kwargs, out)
 
 
 to_affine_fake_quantized = AffineFakeQuantizedTensor.from_float
