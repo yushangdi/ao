@@ -80,6 +80,65 @@ _QLINEAR_DISPATCH_TABLE = {}
 def _register_quantized_linear_dispatch(dispatch_condition, impl):
     _QLINEAR_DISPATCH_TABLE[dispatch_condition] = impl
 
+
+class _AQTFromFloat(torch.autograd.Function):
+    """
+    Differentiable constructor for `AffineQuantizedTensor`.
+    """
+
+    @staticmethod
+    def forward(
+        ctx: torch.autograd.function.FunctionCtx,
+        input_float: torch.Tensor,
+        mapping_type: MappingType,
+        block_size: Tuple[int, ...],
+        target_dtype: torch.dtype,
+        quant_min: Optional[int] = None,
+        quant_max: Optional[int]  = None,
+        eps: Optional[float] = None,
+        scale_dtype: Optional[torch.dtype] = None,
+        zero_point_dtype: Optional[torch.dtype] = None,
+        preserve_zero: bool = True,
+        zero_point_domain: ZeroPointDomain = ZeroPointDomain.INT,
+        layout_type: LayoutType = PlainLayoutType(),
+        use_hqq: bool = False,
+    ):
+        original_shape = input_float.shape
+        input_float = layout_type.pre_process(input_float)
+
+        if use_hqq:
+            assert zero_point_domain == ZeroPointDomain.FLOAT and mapping_type == MappingType.ASYMMETRIC and quant_min==0, "Invalid input parameters for HQQ quantization."
+            nbits = int(math.log2(quant_max + 1))
+            axis  = 1 if (block_size[0]==1) else 0
+            group_size = max(block_size)
+            compute_dtype = zero_point_dtype if (zero_point_dtype is not None) else input_float.dtype
+            device = input_float.device
+            int_data, scale, zero_point, _ = quantize_affine_hqq(input_float, nbits=nbits, group_size=group_size, axis=axis, compute_dtype=compute_dtype, device=device, verbose=False, raw_output=False)
+            int_data = int_data.to(target_dtype)
+        else:
+            scale, zero_point = choose_qparams_affine(input_float, mapping_type, block_size, target_dtype, quant_min, quant_max, eps, scale_dtype, zero_point_dtype, preserve_zero, zero_point_domain)
+            int_data = quantize_affine(input_float, block_size, scale, zero_point, target_dtype, quant_min, quant_max, zero_point_domain)
+            # Note: output will be uint8 tensor for sub byte tensors for now
+
+        int_data = layout_type.post_process(int_data)
+        layout_tensor_ctr = get_layout_tensor_constructor(type(layout_type))
+        layout_tensor = layout_tensor_ctr(int_data, scale, zero_point, layout_type)
+        return AffineQuantizedTensor(
+            layout_tensor,
+            block_size,
+            original_shape,
+            quant_min,
+            quant_max,
+            zero_point_domain,
+            dtype=input_float.dtype
+        )
+
+    @staticmethod
+    def backward(ctx, gy):
+        return gy, None, None, None, None, None, None, None, None, None, None, None, None
+
+
+
 class AffineQuantizedTensor(TorchAOBaseTensor):
     """
     Affine quantized tensor subclass. Affine quantization means we quantize the floating point tensor with an affine transformation:
@@ -116,18 +175,11 @@ class AffineQuantizedTensor(TorchAOBaseTensor):
         quant_min: Optional[int] = None,
         quant_max: Optional[int] = None,
         zero_point_domain: ZeroPointDomain = ZeroPointDomain.INT,
-        dtype=None,
-        strides=None,
+        **kwargs,
     ):
-        kwargs = {}
-        kwargs["device"] = layout_tensor.device
-        kwargs["layout"] = (
-            kwargs.get("layout") if kwargs.get("layout", False) else layout_tensor.layout
-        )
-        kwargs["dtype"] = dtype
-        if strides is not None:
-            kwargs["strides"] = strides
-        kwargs["requires_grad"] = False
+        kwargs.setdefault("device") = layout_tensor.device
+        kwargs.setdefault("layout") = layout_tensor.layout
+        kwargs.setdefault("requires_grad", layout_tensor.requires_grad)
         return torch.Tensor._make_wrapper_subclass(cls, shape, **kwargs)  # type: ignore[attr-defined]
 
     def __init__(
@@ -138,8 +190,7 @@ class AffineQuantizedTensor(TorchAOBaseTensor):
         quant_min: Optional[int] = None,
         quant_max: Optional[int] = None,
         zero_point_domain: ZeroPointDomain = ZeroPointDomain.INT,
-        dtype=None,
-        strides=None,
+        **kwargs,
     ):
         self.layout_tensor = layout_tensor
         self.block_size = block_size
@@ -203,36 +254,23 @@ class AffineQuantizedTensor(TorchAOBaseTensor):
         layout_type: LayoutType = PlainLayoutType(),
         use_hqq: bool = False,
     ):
-        original_shape = input_float.shape
-        input_float = layout_type.pre_process(input_float)
-
-        if use_hqq:
-            assert zero_point_domain == ZeroPointDomain.FLOAT and mapping_type == MappingType.ASYMMETRIC and quant_min==0, "Invalid input parameters for HQQ quantization."
-            nbits = int(math.log2(quant_max + 1))
-            axis  = 1 if (block_size[0]==1) else 0
-            group_size = max(block_size)
-            compute_dtype = zero_point_dtype if (zero_point_dtype is not None) else input_float.dtype
-            device = input_float.device
-            int_data, scale, zero_point, _ = quantize_affine_hqq(input_float, nbits=nbits, group_size=group_size, axis=axis, compute_dtype=compute_dtype, device=device, verbose=False, raw_output=False)
-            int_data = int_data.to(target_dtype)
-        else:
-            scale, zero_point = choose_qparams_affine(input_float, mapping_type, block_size, target_dtype, quant_min, quant_max, eps, scale_dtype, zero_point_dtype, preserve_zero, zero_point_domain)
-            int_data = quantize_affine(input_float, block_size, scale, zero_point, target_dtype, quant_min, quant_max, zero_point_domain)
-            # Note: output will be uint8 tensor for sub byte tensors for now
-
-        int_data = layout_type.post_process(int_data)
-        layout_tensor_ctr = get_layout_tensor_constructor(type(layout_type))
-        layout_tensor = layout_tensor_ctr(int_data, scale, zero_point, layout_type)
-        return cls(
-            layout_tensor,
+        return _AQTFromFloat.apply(
+            input_float,
+            mapping_type,
             block_size,
-            original_shape,
+            target_dtype,
             quant_min,
             quant_max,
+            eps,
+            scale_dtype,
+            zero_point_dtype,
+            preserve_zero,
             zero_point_domain,
-            dtype=input_float.dtype
+            layout_type,
+            use_hqq,
         )
 
+    # TODO: make a differentiable constructor for this
     @classmethod
     def from_float_static(
         cls,
