@@ -48,12 +48,16 @@ class ScalingGranularity(enum.Enum):
 @dataclass(frozen=True)
 class CastConfig:
     """
-    Configuration for casting a single tensor to float8
+    Configuration for maybe casting a single tensor to float8
     """
 
     scaling_type: ScalingType = ScalingType.DYNAMIC
     scaling_granularity: ScalingGranularity = ScalingGranularity.TENSORWISE
     static_scale: Optional[torch.Tensor] = None
+    # If True, this tensor is not scaled to float8 and left in its original
+    # precision.
+    # TODO(ideally before this PR lands): a better name for this
+    keep_in_original_precision: bool = False
 
     def __post_init__(self):
         if self.scaling_type is ScalingType.STATIC:
@@ -98,7 +102,7 @@ class Float8GemmConfig:
     use_fast_accum: bool = False
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=False)
 class Float8LinearConfig:
     """
     Configuration for converting a `torch.nn.Linear` module to float8
@@ -113,8 +117,22 @@ class Float8LinearConfig:
     cast_config_grad_output: CastConfig = CastConfig()
 
     #
+    # Optional per-tensor configuration for `input`, `weight`, `grad_output` to
+    # calculate `grad_weight`, `grad_input`, and `grad_weight` respectively.
+    # If not specified, then the configuration from `cast_config_input`,
+    # `cast_config_weight` and `cast_config_grad_output`, respectively, is reused.
+    # TODO(future PR): maybe rename `cast_config_input` to 
+    # `cast_config_input_for_output`, etc, to make the names consistent, 
+    # will be BC-breaking.
+    #
+    cast_config_input_for_grad_weight: Optional[CastConfig] = None
+    cast_config_weight_for_grad_input: Optional[CastConfig] = None
+    cast_config_grad_output_for_grad_weight: Optional[CastConfig] = None
+
+    #
     # Per-gemm configuration for gemms calculating `output`, `grad_input` and
     # `grad_weight`
+    # TODO(this PR): throw warning if fast_accum False is used with axiswise scaling
     #
     gemm_config_output: Float8GemmConfig = Float8GemmConfig(use_fast_accum=True)
     gemm_config_grad_input: Float8GemmConfig = Float8GemmConfig()
@@ -156,28 +174,134 @@ class Float8LinearConfig:
     delayed_scaling_config: DelayedScalingConfig = DelayedScalingConfig()
 
     def __post_init__(self):
+        # populate the additional cast overrides, if the user did not specify them
+        if self.cast_config_input_for_grad_weight is None:
+            self.cast_config_input_for_grad_weight = self.cast_config_input
+        if self.cast_config_weight_for_grad_input is None:
+            self.cast_config_weight_for_grad_input = self.cast_config_weight
+        if self.cast_config_grad_output_for_grad_weight is None:
+            self.cast_config_grad_output_for_grad_weight = self.cast_config_grad_output
+
         # float8 all-gather only supports tensorwise, in the future may support blockwise
         if self.cast_config_weight.scaling_granularity != ScalingGranularity.TENSORWISE:
             assert not self.enable_fsdp_float8_all_gather, \
                 f"enable_fsdp_float8_all_gather only supports tensorwise scaling granularity, got {self.cast_config_weight.scaling_granularity}"
 
-        # for now, axiswise granularity is all-or-nothing
-        # TODO(future PR): enable more granular setting per-gemm-input
-        has_any_axiswise_scaling = (
-            self.cast_config_input.scaling_granularity is ScalingGranularity.AXISWISE or
-            self.cast_config_weight.scaling_granularity is ScalingGranularity.AXISWISE or
-            self.cast_config_grad_output.scaling_granularity is ScalingGranularity.AXISWISE
-        )
-        has_all_axiswise_scaling = (
-            self.cast_config_input.scaling_granularity is ScalingGranularity.AXISWISE and
-            self.cast_config_weight.scaling_granularity is ScalingGranularity.AXISWISE and
-            self.cast_config_grad_output.scaling_granularity is ScalingGranularity.AXISWISE
-        )
-        if has_any_axiswise_scaling:
-            assert has_all_axiswise_scaling, \
-                "for now, axiswise scaling must be enabled for either all casts or none of the casts"
+        # save some characters in the compatibility checks below
+        cc_i = self.cast_config_input
+        cc_w = self.cast_config_weight
+        cc_go = self.cast_config_grad_output
+        cc_i_gw = self.cast_config_input_for_grad_weight
+        cc_w_gi = self.cast_config_weight_for_grad_input
+        cc_go_gw = self.cast_config_grad_output_for_grad_weight
+
+        # for now, we only have gemm kernels where both operands are either both
+        # in high precision, or both in float8. In the future, this may be relaxed.
+        # TODO(future): make the float8 check more precise with the specific dtypes.
+        assert cc_i.keep_in_original_precision == cc_w.keep_in_original_precision, \
+            "incompatible operand precision for output"
+        assert cc_go.keep_in_original_precision == cc_w_gi.keep_in_original_precision, \
+            "incompatible operand precision for grad_input"
+        assert cc_i_gw.keep_in_original_precision == cc_go_gw.keep_in_original_precision, \
+            "incompatible operand precision for grad_weight"
+
 
 # If True, use 'fnuz' float8 types for calculations.
 # Currently, ROCm only supports fnuz variants.
 # TODO(future PR): move this to Float8LinearConfig
 use_fnuz_dtype = False
+
+
+# Pre-made recipes for common configurations
+# TODO(future PR): go through a round of design on this, and eventually expose
+# as a top level public API.
+class _Float8LinearRecipeName(enum.Enum):
+    ALL_TENSORWISE = "all_tensorwise"
+    ALL_AXISWISE = "all_axiswise"
+    LW_AXISWISE_WITH_GW_HP = "lw_axiswise_with_gw_hp"
+
+
+def _recipe_name_to_linear_config(
+    recipe_name: _Float8LinearRecipeName,
+) -> Float8LinearConfig:
+    """
+    Input: `_Float8LinearRecipeName` value
+    Output: a `Float8LinearConfig` configured to implement the recipe
+    """
+
+    if recipe_name is _Float8LinearRecipeName.ALL_TENSORWISE:
+        # Default, dynamic per-tensor scaling with the cuBLAS tensorwise kernel
+        return Float8LinearConfig()
+
+    elif recipe_name is _Float8LinearRecipeName.ALL_AXISWISE:
+        # dynamic axiswise scaling with the CUTLASS rowwise kernel
+        cc_i = CastConfig(scaling_granularity=ScalingGranularity.AXISWISE)
+        cc_w = CastConfig(scaling_granularity=ScalingGranularity.AXISWISE)
+        cc_go = CastConfig(scaling_granularity=ScalingGranularity.AXISWISE)
+        
+        # The current rowwise CUTLASS kernels in `torch._scaled_mm` are only
+        # fast with `use_fast_accum=True`. Note that rowwise scaling is more
+        # accurate than tensorwise scaling, so the overall impact on accuracy
+        # of tensorwise vs rowwise taking this flag into account will vary.
+        gc_o = Float8GemmConfig(use_fast_accum=True)
+        gc_gi = Float8GemmConfig(use_fast_accum=True)
+        gc_gw = Float8GemmConfig(use_fast_accum=True)
+
+        return Float8LinearConfig(
+            cast_config_input=cc_i,
+            cast_config_weight=cc_w,
+            cast_config_grad_output=cc_go,
+            gemm_config_output=gc_o,
+            gemm_config_grad_input=gc_gi,
+            gemm_config_grad_weight=gc_gw,
+        )
+
+    elif recipe_name is _Float8LinearRecipeName.LW_AXISWISE_WITH_GW_HP:
+
+        # lw's recipe for a modification on all-axiswise:
+        #
+        #   output_hp = input_fp8_axiswise_dim0 @ weight_t_axiswise_dim1
+        #   grad_input_hp = grad_output_fp8_axiswise_dim0 @ weight_fp8_tensorwise
+        #   grad_weight_hp = input_t_hp @ grad_output_hp
+        #
+        # key characteristics:
+        #   * increased accuracy for grad_weight
+        #   * `output` and `weight` now only need to be scaled axiswise across a 
+        #     single dim compared to vanilla all-axiswise, which is more 
+        #     amenable to fast kernels
+
+        # output_hp = input_fp8_axiswise_dim0 @ weight_t_axiswise_dim1
+        cc_i = CastConfig(scaling_granularity=ScalingGranularity.AXISWISE)
+        cc_w = CastConfig(scaling_granularity=ScalingGranularity.AXISWISE)
+
+        # grad_input_hp = grad_output_fp8_axiswise_dim0 @ weight_fp8_tensorwise
+        cc_go = CastConfig(scaling_granularity=ScalingGranularity.AXISWISE)
+        cc_w_gi = CastConfig(scaling_granularity=ScalingGranularity.TENSORWISE)
+
+        # grad_weight_hp = input_t_hp @ grad_output_hp
+        cc_i_gw = CastConfig(keep_in_original_precision=True)
+        cc_go_gw = CastConfig(keep_in_original_precision=True)
+
+        # The current rowwise CUTLASS kernels in `torch._scaled_mm` are only
+        # fast with `use_fast_accum=True`. Note that rowwise scaling is more
+        # accurate than tensorwise scaling, so the overall impact on accuracy
+        # of tensorwise vs rowwise taking this flag into account will vary.
+        gc_o = Float8GemmConfig(use_fast_accum=True)
+        gc_gi = Float8GemmConfig(use_fast_accum=True)
+        gc_gw = Float8GemmConfig(use_fast_accum=True)
+
+        return Float8LinearConfig(
+            cast_config_input=cc_i,
+            cast_config_weight=cc_w,
+            cast_config_grad_output=cc_go,
+            cast_config_input_for_grad_weight=cc_i_gw,
+            cast_config_weight_for_grad_input=cc_w_gi,
+            cast_config_grad_output_for_grad_weight=cc_go_gw,
+            gemm_config_output=gc_o,
+            gemm_config_grad_input=gc_gi,
+            gemm_config_grad_weight=gc_gw,
+        )
+
+    else:
+        # TODO(before land): make recipe_name an enum and tell users what the options are
+        raise AssertionError(f"unknown recipe_name {recipe_name}")
