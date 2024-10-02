@@ -11,7 +11,7 @@
 #include <torchao/experimental/kernels/cpu/aarch64/bitpacking/bitpack.h>
 #include <torchao/experimental/kernels/cpu/aarch64/linear/linear.h>
 #include <torchao/experimental/kernels/cpu/aarch64/tests/test_utils.h>
-#include <torchao/experimental/kernels/cpu/aarch64/kleidi/kai_matmul_clamp_f32_qai8dxp_qsi4c32p.h>
+#include <torchao/experimental/kernels/cpu/aarch64/kleidi/kai_matmul_clamp_f32_qai8dxp1x8_qsi4c32p4x8_1x4x32_neon_dotprod.h>
 #include <vector>
 
 float kTol = 0.0001;
@@ -419,7 +419,7 @@ TEST(
       false /*has_weight_zeros*/,
       false /*has_bias*/,
       false /*has_clamp*/>(
-      /*m=*/16, /*k=*/64, /*n=*/16, /*group_size=*/32);
+      /*m=*/1, /*k=*/32, /*n=*/2, /*group_size=*/32);
 }
 
 #endif // defined(__aarch64__) || defined(__ARM_NEON)
