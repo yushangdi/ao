@@ -285,7 +285,7 @@ class TorchAOTensorParallelTestCase(DTensorTestBase):
         device = "cuda"
         # To make sure different ranks create the same module
         torch.manual_seed(5)
-
+        print('Step 1')
         class M(torch.nn.Module):
             def __init__(self, in_features, out_features, **kwargs) -> None:
                 super().__init__(**kwargs)
@@ -293,41 +293,45 @@ class TorchAOTensorParallelTestCase(DTensorTestBase):
 
             def forward(self, x: torch.Tensor) -> torch.Tensor:
                 return self.linear(x)
-
+        print('Step 2')
         # Get rank and device
         device = torch.device(f"cuda:{self.rank % torch.cuda.device_count()}")
-
+        print('Step 3')
         # Original model
         proj_up = M(1024, 2048).to(device).to(dtype)
         proj_dn = M(2048, 1024).to(device).to(dtype)
         example_input = 100 * torch.randn(128, 1024, device=device, dtype=dtype)
         y = proj_dn(proj_up(example_input))
-
+        print('Step 4')
         # Quantize the model
         up_quant = self.quantize(proj_up)
         dn_quant = self.quantize(proj_dn)
         y_q = dn_quant(up_quant(example_input))
-
+        print('Step 5')
         mesh = self.build_device_mesh()
         # Shard the models
         up_dist = self.colwise_shard(up_quant, mesh)
         dn_dist = self.rowwise_shard(dn_quant, mesh)
-
+        print('Step 6')
         # We need to turn inputs into DTensor form as well -- just a format change
         input_dtensor = DTensor.from_local(
             example_input, mesh, [Replicate()]
         )
-
+        print('Step 7')
         y_d = dn_dist(up_dist(input_dtensor))
-
+        print('Step 8')
         if not TORCH_VERSION_AT_LEAST_2_5:
             # Need torch 2.5 to support compiled tensor parallelism
             return
-
+        print('Step 9')
         up_compiled = torch.compile(up_dist)
+        print('Step 10')
         y_up = up_compiled(input_dtensor)
+        print('Step 11')
         dn_compiled = torch.compile(dn_dist)
+        print('Step 12')
         y_dn = dn_compiled(y_up)
+        print('Step 13')
 
 common_utils.instantiate_parametrized_tests(TorchAOBasicTestCase)
 common_utils.instantiate_parametrized_tests(TorchAOCompileTestCase)
